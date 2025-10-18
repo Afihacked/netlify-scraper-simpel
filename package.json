@@ -1,0 +1,16 @@
+{
+  "name": "netlify-scraper-simpel",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Netlify Function that scrapes static pages from SIMPEL Pekalongan",
+  "main": "netlify/functions/scrape.js",
+  "scripts": {
+    "start": "netlify dev",
+    "build": "echo \"build done\""
+  },
+  "dependencies": {
+    "axios": "^1.5.0",
+    "cheerio": "^1.0.0-rc.12",
+    "node-cache": "^5.1.2"
+  }
+}
