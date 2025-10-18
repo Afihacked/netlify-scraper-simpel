@@ -9,10 +9,16 @@ const cache = new NodeCache({ stdTTL: 60 * 5, checkperiod: 120 }); // cache 5 mi
 // Default target site (you can pass ?url= to override)
 const DEFAULT_BASE = "https://simpel.pekalongankab.go.id";
 
+// Use environment variable for User-Agent if provided (safer)
+const DEFAULT_UA =
+  process.env.SCRAPER_UA ||
+  "netlify-scraper/1.0 (+https://github.com/Afihacked; contact: afitech.services@gmail.com)";
+
 exports.handler = async function (event, context) {
   try {
     const qs = event.queryStringParameters || {};
     const url = qs.url ? decodeURIComponent(qs.url) : DEFAULT_BASE;
+    const debug = qs.debug === "1" || qs.debug === "true";
 
     // Basic validation: allow only same-origin or paths under the domain to avoid open proxy abuse
     if (!isAllowedUrl(url)) {
@@ -24,8 +30,8 @@ exports.handler = async function (event, context) {
       };
     }
 
-    // Check cache
-    const cacheKey = `scrape:${url}`;
+    // Check cache (cache key includes debug flag so debug responses are fresh)
+    const cacheKey = `scrape:${url}:${debug ? "debug" : "nodebug"}`;
     const cached = cache.get(cacheKey);
     if (cached) {
       return {
@@ -38,14 +44,17 @@ exports.handler = async function (event, context) {
     // Fetch HTML
     const res = await axios.get(url, {
       headers: {
-        "User-Agent":
-          "netlify-scraper/1.0 (+https://github.com/Afihacked; contact: afitech.services@gmail.com)",
+        "User-Agent": DEFAULT_UA,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       },
       timeout: 15000,
       responseType: "text",
+      maxRedirects: 5,
     });
 
     const html = res.data || "";
+    const html_sample = html.slice(0, 3000); // first bytes for debug
+
     const $ = cheerio.load(html);
 
     // Extract useful data: title, meta, headings, links, tables
@@ -53,7 +62,6 @@ exports.handler = async function (event, context) {
 
     const metas = {};
     $("head meta").each((i, el) => {
-      // read name/property/itemprop and content safely
       const $el = $(el);
       const name =
         $el.attr("name") || $el.attr("property") || $el.attr("itemprop");
@@ -63,7 +71,6 @@ exports.handler = async function (event, context) {
 
     const headings = [];
     $("h1,h2,h3,h4,h5").each((i, el) => {
-      // get tag name in a safe way and text
       const tagName =
         el && (el.tagName || el.name)
           ? (el.tagName || el.name).toLowerCase()
@@ -91,7 +98,6 @@ exports.handler = async function (event, context) {
         $tr.find("th, td").each((ci, td) => {
           cols.push($(td).text().trim());
         });
-        // only push non-empty rows (optional)
         rows.push(cols);
       });
       tables.push(rows);
@@ -102,13 +108,25 @@ exports.handler = async function (event, context) {
     // store to cache
     cache.set(cacheKey, data);
 
+    // If debug requested, include HTML sample and HTTP status
+    if (debug) {
+      return {
+        statusCode: 200,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ok: true,
+          cached: false,
+          data: { ...data, status: res.status, html_sample },
+        }),
+      };
+    }
+
     return {
       statusCode: 200,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ok: true, cached: false, data }),
     };
   } catch (err) {
-    // log full error for debugging
     console.error("Scrape error", err);
     return {
       statusCode: 500,
