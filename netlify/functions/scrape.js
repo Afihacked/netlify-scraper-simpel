@@ -3,34 +3,27 @@ const axios = require("axios");
 const cheerio = require("cheerio");
 const NodeCache = require("node-cache");
 
-// Simple in-memory cache to reduce repeated fetches on Netlify instances
-const cache = new NodeCache({ stdTTL: 60 * 5, checkperiod: 120 }); // cache 5 minutes
+// Simple in-memory cache
+const cache = new NodeCache({ stdTTL: 60 * 5, checkperiod: 120 });
 
-// Default target site (you can pass ?url= to override)
 const DEFAULT_BASE = "https://simpel.pekalongankab.go.id";
-
-// Use environment variable for User-Agent if provided (safer)
 const DEFAULT_UA =
   process.env.SCRAPER_UA ||
   "netlify-scraper/1.0 (+https://github.com/Afihacked; contact: afitech.services@gmail.com)";
 
-exports.handler = async function (event, context) {
+exports.handler = async function (event) {
   try {
     const qs = event.queryStringParameters || {};
     const url = qs.url ? decodeURIComponent(qs.url) : DEFAULT_BASE;
     const debug = qs.debug === "1" || qs.debug === "true";
 
-    // Basic validation: allow only same-origin or paths under the domain to avoid open proxy abuse
     if (!isAllowedUrl(url)) {
       return {
         statusCode: 400,
-        body: JSON.stringify({
-          error: "URL not allowed. Use a path or the configured domain.",
-        }),
+        body: JSON.stringify({ error: "URL not allowed." }),
       };
     }
 
-    // Check cache (cache key includes debug flag so debug responses are fresh)
     const cacheKey = `scrape:${url}:${debug ? "debug" : "nodebug"}`;
     const cached = cache.get(cacheKey);
     if (cached) {
@@ -41,25 +34,35 @@ exports.handler = async function (event, context) {
       };
     }
 
-    // Fetch HTML
     const res = await axios.get(url, {
-      headers: {
-        "User-Agent": DEFAULT_UA,
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      },
+      headers: { "User-Agent": DEFAULT_UA, Accept: "text/html" },
       timeout: 15000,
-      responseType: "text",
-      maxRedirects: 5,
     });
 
     const html = res.data || "";
-    const html_sample = html.slice(0, 3000); // first bytes for debug
-
     const $ = cheerio.load(html);
 
-    // Extract useful data: title, meta, headings, links, tables
-    const title = ($("head > title").text() || "").trim();
+    // 1) Try to detect data-page on #app (Inertia-style)
+    let dataPage = null;
+    const appEl = $("#app");
+    if (appEl && appEl.attr("data-page")) {
+      const raw = appEl.attr("data-page");
+      // decode common HTML entities produced by attribute encoding
+      const decoded = decodeHtmlEntities(raw);
+      try {
+        dataPage = JSON.parse(decoded);
+      } catch (e) {
+        // fallback: try to unescape quotes then parse
+        try {
+          dataPage = JSON.parse(raw.replace(/&quot;/g, '"').replace(/&amp;/g, "&"));
+        } catch (ee) {
+          dataPage = null;
+        }
+      }
+    }
 
+    // 2) Extract standard HTML items (headings/links/tables) for fallback
+    const title = ($("head > title").text() || "").trim();
     const metas = {};
     $("head meta").each((i, el) => {
       const $el = $(el);
@@ -71,10 +74,7 @@ exports.handler = async function (event, context) {
 
     const headings = [];
     $("h1,h2,h3,h4,h5").each((i, el) => {
-      const tagName =
-        el && (el.tagName || el.name)
-          ? (el.tagName || el.name).toLowerCase()
-          : "h";
+      const tagName = el && (el.tagName || el.name) ? (el.tagName || el.name).toLowerCase() : "h";
       headings.push({ tag: tagName, text: $(el).text().trim() });
     });
 
@@ -83,32 +83,33 @@ exports.handler = async function (event, context) {
       const $el = $(el);
       const href = $el.attr("href") || "";
       const text = $el.text().trim() || null;
-      // Normalize relative URLs to absolute when possible
-      const absolute = makeAbsoluteUrl(url, href);
-      links.push({ href: absolute, text });
+      links.push({ href: makeAbsoluteUrl(url, href), text });
     });
 
-    const tables = [];
-    $("table").each((i, tableEl) => {
-      const $table = $(tableEl);
-      const rows = [];
-      $table.find("tr").each((ri, tr) => {
-        const $tr = $(tr);
-        const cols = [];
-        $tr.find("th, td").each((ci, td) => {
-          cols.push($(td).text().trim());
-        });
-        rows.push(cols);
-      });
-      tables.push(rows);
-    });
+    // 3) If dataPage exists, extract useful parts
+    let parsed = null;
+    if (dataPage && typeof dataPage === "object") {
+      const props = dataPage.props || {};
+      parsed = {
+        component: dataPage.component || null,
+        propsSummary: summarizeProps(props),
+        settings: props.settings || null,
+        years: props.years || null,
+        budgets: props.budgets || null,
+        ziggy: (props.ziggy ? props.ziggy : dataPage.props && dataPage.props.ziggy) || null,
+      };
 
-    const data = { url, title, metas, headings, links, tables };
+      // If ziggy found, extract routes (map to full URLs)
+      if (parsed.ziggy && parsed.ziggy.url && parsed.ziggy.routes) {
+        parsed.routes = mapZiggyRoutesToUrls(parsed.ziggy.url, parsed.ziggy.routes);
+      }
+    }
 
-    // store to cache
+    const data = { url, title, metas, headings, links, parsed };
+
     cache.set(cacheKey, data);
 
-    // If debug requested, include HTML sample and HTTP status
+    // If debug requested include html sample and status
     if (debug) {
       return {
         statusCode: 200,
@@ -116,7 +117,7 @@ exports.handler = async function (event, context) {
         body: JSON.stringify({
           ok: true,
           cached: false,
-          data: { ...data, status: res.status, html_sample },
+          data: { ...data, status: res.status, html_sample: html.slice(0, 3000) },
         }),
       };
     }
@@ -130,20 +131,15 @@ exports.handler = async function (event, context) {
     console.error("Scrape error", err);
     return {
       statusCode: 500,
-      body: JSON.stringify({
-        ok: false,
-        error:
-          err && err.message ? err.message : String(err) || "Unknown error",
-      }),
+      body: JSON.stringify({ ok: false, error: err && err.message ? err.message : String(err) }),
     };
   }
 };
 
-// Helpers
+// ---------- helpers ----------
 function isAllowedUrl(target) {
   try {
     const t = new URL(target, DEFAULT_BASE);
-    // only allow same host as DEFAULT_BASE, or paths within it
     const base = new URL(DEFAULT_BASE);
     return t.hostname === base.hostname;
   } catch (e) {
@@ -154,13 +150,51 @@ function isAllowedUrl(target) {
 function makeAbsoluteUrl(base, href) {
   try {
     if (!href) return null;
-    // if href already absolute
     if (/^https?:\/\//i.test(href)) return href;
-    // ignore javascript: and mailto:
     if (/^(javascript:|mailto:|#)/i.test(href)) return href;
     const baseUrl = new URL(base);
     return new URL(href, baseUrl).toString();
   } catch (e) {
     return href;
+  }
+}
+
+function decodeHtmlEntities(str) {
+  if (!str || typeof str !== "string") return str;
+  return str
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#39;/g, "'");
+}
+
+function summarizeProps(props) {
+  // Return lightweight summary of props keys to avoid huge payloads
+  const summary = {};
+  if (!props) return summary;
+  const candidateKeys = ["settings", "years", "budgets", "perPages", "app", "auth", "ziggy"];
+  candidateKeys.forEach((k) => {
+    if (props[k]) summary[k] = props[k];
+  });
+  // include any top-level arrays like years/budgets
+  return summary;
+}
+
+function mapZiggyRoutesToUrls(baseUrl, routes) {
+  try {
+    const out = {};
+    const base = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
+    Object.keys(routes).forEach((k) => {
+      const r = routes[k];
+      if (r && r.uri) {
+        // join base + '/' + r.uri (ensure no double slash)
+        const uri = r.uri.startsWith("/") ? r.uri : "/" + r.uri;
+        out[k] = base + uri;
+      }
+    });
+    return out;
+  } catch (e) {
+    return null;
   }
 }
